@@ -19,6 +19,7 @@ import os
 import sqlite3
 import sys
 import textwrap
+from google import genai
 
 # ---------------------------------------------------------------------------
 # Config
@@ -200,10 +201,10 @@ def generate_work_experience():
     section("Step 3 — Generating workExperience.json from resume.txt")
 
     try:
-        import google.generativeai as genai
+        import google.genai as genai
     except ImportError:
         fail(
-            "google-generativeai is not installed.\n"
+            "google-genai is not installed.\n"
             "  Run: pip install -r requirements.txt"
         )
 
@@ -240,11 +241,17 @@ def generate_work_experience():
         {resume_text}
     """)
 
-    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-    model = genai.GenerativeModel("gemini-1.5-flash")
+
+
+    client = genai.Client(
+        api_key=os.environ["GEMINI_API_KEY"]
+    )
 
     try:
-        response = model.generate_content(prompt)
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+        )
         raw = response.text.strip()
     except Exception as e:
         fail(f"Gemini API call failed: {e}")
