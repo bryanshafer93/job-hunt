@@ -200,18 +200,12 @@ def generate_work_experience():
     section("Step 3 — Generating workExperience.json from resume.txt")
 
     try:
-        from google import genai
+        import google.generativeai as genai
     except ImportError:
         fail(
-            "google-genai is not installed.\n"
+            "google-generativeai is not installed.\n"
             "  Run: pip install -r requirements.txt"
         )
-
-    MODELS = [
-        "gemini-2.5-flash",       # primary
-        "gemini-2.5-flash-lite",  # fallback 1
-        "gemini-1.5-flash",       # fallback 2
-    ]
 
     with open(RESUME_TXT, "r", encoding="utf-8") as f:
         resume_text = f.read()
@@ -246,24 +240,14 @@ def generate_work_experience():
         {resume_text}
     """)
 
-    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
-    raw = None
+    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+    model = genai.GenerativeModel("gemini-1.5-flash")
 
-    for model_name in MODELS:
-        try:
-            info(f"Trying model: {model_name}")
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-            )
-            raw = response.text.strip()
-            ok(f"Got response from {model_name}")
-            break
-        except Exception as e:
-            warn(f"{model_name} failed: {e}")
-
-    if not raw:
-        fail("All Gemini models failed. Check your API key and network connection.")
+    try:
+        response = model.generate_content(prompt)
+        raw = response.text.strip()
+    except Exception as e:
+        fail(f"Gemini API call failed: {e}")
 
     # Strip markdown code fences if present
     if raw.startswith("```"):

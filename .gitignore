@@ -1,6 +1,7 @@
 # Environment variables (FIXED: removed the trailing slash to match the file)
 .env
 .env.backup
+credentials.json
 
 # Python specific
 __pycache__/
