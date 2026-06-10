@@ -1,0 +1,41 @@
+# Gmail API
+google-api-python-client
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+
+# Gemini API
+google-genai
+
+# Local LLM / HTTP
+requests
+
+# HTML parsing
+beautifulsoup4
+lxml
+
+# Browser automation
+playwright
+
+# Streamlit dashboard
+streamlit
+plotly
+
+# Environment variables
+python-dotenv
+
+# Retry handling
+tenacity
+
+# Data utilities
+pandas
+
+# Optional: better logging formatting
+rich
+
+#text scraping
+trafilatura
+
+#embedding
+sentence-transformers
+
