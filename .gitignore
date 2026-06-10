@@ -1,0 +1,43 @@
+# Environment variables (FIXED: removed the trailing slash to match the file)
+.env
+.env.backup
+
+# Python specific
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+logs/
+*.log
+
+# IDEs and Editors
+.idea/
+.vscode/
+
+# Project Specific / Large files
+jobParser/
+models/
+*.gguf
+linkedin_profile/
+
+# System files
+System Volume Information/
+
+#personal work experience
+workExperience.json
+
+token.json
+dedupe.py
+check_seen.py
+clear_seen.py
+backfill_company_names.py
+
+watcher.log*
