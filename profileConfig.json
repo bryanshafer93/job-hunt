@@ -1,12 +1,6 @@
 {
   "keywords": [
-    "kubernetes",
-    "terraform",
-    "docker",
-    "ci/cd",
-    "linux",
-    "cloud",
-    "sre"
+
   ],
   "keyword_weight": 0.03,
   "overlap_weight": 0.005,

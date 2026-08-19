@@ -29,13 +29,18 @@ tenacity
 
 # Data utilities
 pandas
+numpy
 
 # Optional: better logging formatting
 rich
 
-#text scraping
+# Text scraping
 trafilatura
 
-#embedding
-sentence-transformers
-
+# Embedding — versions pinned to avoid Windows segfault on DNS lookup
+sentence-transformers==2.7.0
+transformers==4.41.2
+tokenizers==0.19.1
+huggingface-hub
+scikit-learn
+torch

@@ -1,14 +1,15 @@
 """
-setup.py — first-run setup for job-hunt pipeline
+setup.py — first-run setup orchestrator for job-hunt pipeline
 
-Steps automated:
-  1. Validate required files exist (.env, credentials.json, resume.txt)
-  2. Initialize the database (idempotent)
-  3. If experience_chunks is empty:
-       a. Send resume.txt + workExperienceTemplate.json to Gemini
-       b. Validate and save output as workExperience.json
-       c. Run resume ingestion (embeddings -> experience_chunks)
-  4. Print next steps
+What it does:
+  1. Validates required files (.env, credentials.json, resume.txt)
+  2. Calls init_db.init_db() to create tables (idempotent)
+  3. Downloads embedding model if not cached
+  4. If experience_chunks is empty:
+       a. Sends resume.txt + workExperienceTemplate.json to Gemini
+       b. Validates and saves output as workExperience.json
+       c. Runs ingest_resume.py as subprocess
+  5. Prints next steps
 
 Usage:
   python setup.py
@@ -17,25 +18,45 @@ Usage:
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import textwrap
-from google import genai
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
-DB_NAME    = os.path.join(BASE_DIR, "jobs.db")
-ENV_PATH   = os.path.join(BASE_DIR, ".env")
-CREDS_PATH = os.path.join(BASE_DIR, "credentials.json")
 RESUME_TXT = os.path.join(BASE_DIR, "resume.txt")
 TEMPLATE   = os.path.join(BASE_DIR, "workExperienceTemplate.json")
 WE_JSON    = os.path.join(BASE_DIR, "workExperience.json")
+ENV_PATH   = os.path.join(BASE_DIR, ".env")
+CREDS_PATH = os.path.join(BASE_DIR, "credentials.json")
 
+MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-1.5-flash",
+]
+# ---------------------------------------------------------------------------
+# Step 0 - installing requirements
+# ---------------------------------------------------------------------------
+
+def install_requirements():
+    section("Step 0 — Installing dependencies")
+    req_path = os.path.join(BASE_DIR, "requirements.txt")
+    if not os.path.exists(req_path):
+        fail("requirements.txt not found. Make sure you're running from the project root.")
+    result = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-r", req_path],
+        capture_output=False
+    )
+    if result.returncode != 0:
+        fail("pip install failed. Check the error above.")
+    ok("Dependencies installed")
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Output helpers
 # ---------------------------------------------------------------------------
 
 def ok(msg):   print(f"  ✅  {msg}")
@@ -71,16 +92,12 @@ def load_env():
 def validate_files():
     section("Step 1 — Checking required files")
 
-    missing = []
-
-    # .env + GEMINI_API_KEY
     if not os.path.exists(ENV_PATH):
         fail(
             ".env file not found.\n\n"
-            "  Create it by copying .env.example:\n"
+            "  Copy .env.example and fill in your Gemini API key:\n"
             "    copy .env.example .env\n\n"
-            "  Then add your Gemini API key from:\n"
-            "    https://aistudio.google.com/apikey"
+            "  Get a key at: https://aistudio.google.com/apikey"
         )
     load_env()
     if not os.environ.get("GEMINI_API_KEY"):
@@ -92,7 +109,6 @@ def validate_files():
         )
     ok(".env found with GEMINI_API_KEY")
 
-    # credentials.json
     if not os.path.exists(CREDS_PATH):
         fail(
             "credentials.json not found.\n\n"
@@ -100,93 +116,61 @@ def validate_files():
             "    1. Go to https://console.cloud.google.com/\n"
             "    2. APIs & Services → Credentials\n"
             "    3. Create OAuth 2.0 Client ID (Desktop app)\n"
-            "    4. Download JSON and save as credentials.json in this folder"
+            "    4. Download JSON → save as credentials.json here"
         )
     ok("credentials.json found")
 
-    # resume.txt
     if not os.path.exists(RESUME_TXT):
         fail(
             "resume.txt not found.\n\n"
-            "  Paste your resume as plain text into a file named resume.txt\n"
-            "  and place it in the project root folder.\n\n"
-            "  Tip: copy/paste from your Word doc or LinkedIn profile —\n"
-            "  formatting doesn't matter, just the content."
+            "  Paste your resume as plain text into resume.txt\n"
+            "  and place it in the project root folder.\n"
+            "  Formatting doesn't matter — just the content."
         )
     if os.path.getsize(RESUME_TXT) < 100:
-        fail("resume.txt appears to be empty or too short. Please add your resume content.")
+        fail("resume.txt looks empty. Please add your resume content.")
     ok("resume.txt found")
 
-    # workExperienceTemplate.json
     if not os.path.exists(TEMPLATE):
-        fail("workExperienceTemplate.json not found. It should be included in the repo.")
+        fail("workExperienceTemplate.json not found — it should be in the repo.")
     ok("workExperienceTemplate.json found")
 
 
 # ---------------------------------------------------------------------------
-# Step 2 — Initialize database
+# Step 2 — Init DB (delegates to init_db.py)
 # ---------------------------------------------------------------------------
 
-def init_db():
+def run_init_db():
     section("Step 2 — Initializing database")
-    conn = sqlite3.connect(DB_NAME)
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS processed_urls (
-            url TEXT PRIMARY KEY,
-            processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS approved_jobs (
-            job_id       TEXT PRIMARY KEY,
-            title        TEXT,
-            company      TEXT,
-            score        REAL,
-            reasoning    TEXT,
-            resume_text  TEXT,
-            approved_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            applied      INTEGER DEFAULT 0,
-            job_status   TEXT,
-            notes        TEXT,
-            reviewed_at  TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS denied_jobs (
-            job_id    TEXT PRIMARY KEY,
-            title     TEXT,
-            company   TEXT,
-            score     REAL,
-            reasoning TEXT,
-            denied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS experience_chunks (
-            chunk_id   TEXT PRIMARY KEY,
-            company    TEXT,
-            role       TEXT,
-            start_date TEXT,
-            end_date   TEXT,
-            chunk_type TEXT,
-            text       TEXT,
-            embedding  TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS skill_mentions (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            skill      TEXT,
-            job_id     TEXT,
-            mention_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-    """)
-    conn.commit()
-    conn.close()
+    try:
+        from init_db import init_db
+    except ImportError:
+        fail("init_db.py not found. Make sure you're running from the project root.")
+    init_db()
     ok("Database ready")
 
 
 # ---------------------------------------------------------------------------
-# Step 3 — Check if ingestion is needed
+# Step 3 — Download embedding model
+# ---------------------------------------------------------------------------
+
+def download_model():
+    section("Step 3 — Downloading embedding model")
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError:
+        fail("huggingface-hub is not installed. Run: pip install -r requirements.txt")
+    info("Downloading all-MiniLM-L6-v2 (one-time, ~90MB)...")
+    path = snapshot_download("sentence-transformers/all-MiniLM-L6-v2")
+    ok(f"Model cached at: {path}")
+
+
+# ---------------------------------------------------------------------------
+# Step 4 — Check if ingestion is needed
 # ---------------------------------------------------------------------------
 
 def needs_ingestion():
+    from config import DB_NAME
     conn = sqlite3.connect(DB_NAME)
     count = conn.execute("SELECT COUNT(*) FROM experience_chunks").fetchone()[0]
     conn.close()
@@ -194,27 +178,22 @@ def needs_ingestion():
 
 
 # ---------------------------------------------------------------------------
-# Step 4 — Generate workExperience.json via Gemini
+# Step 5 — Generate workExperience.json via Gemini
 # ---------------------------------------------------------------------------
 
 def generate_work_experience():
-    section("Step 3 — Generating workExperience.json from resume.txt")
+    section("Step 4a — Generating workExperience.json from resume.txt")
 
     try:
-        import google.genai as genai
+        from google import genai
     except ImportError:
-        fail(
-            "google-genai is not installed.\n"
-            "  Run: pip install -r requirements.txt"
-        )
+        fail("google-genai is not installed. Run: pip install -r requirements.txt")
 
     with open(RESUME_TXT, "r", encoding="utf-8") as f:
         resume_text = f.read()
 
     with open(TEMPLATE, "r", encoding="utf-8") as f:
         template = f.read()
-
-    info("Sending resume to Gemini for formatting...")
 
     prompt = textwrap.dedent(f"""
         You are a resume parser. Convert the raw resume text below into a
@@ -226,11 +205,10 @@ def generate_work_experience():
           "experience" array.
         - Each entry needs a unique "id" (snake_case of company+role,
           e.g. "microsoft_senior_engineer").
-        - "skills" should be a list of technical skills visible in that
-          role's context (infer from bullets if not explicit).
+        - "skills" should be technical skills visible in that role's context
+          (infer from bullets if not explicit).
         - "bullets" should be the actual resume bullet points for that role,
-          cleaned up but not rewritten. Include as many bullets as exist,
-          not just 5.
+          cleaned up but not rewritten. Include all bullets, not just 5.
         - Dates in "YYYY-MM" format. Use "Present" for current roles.
         - Do not invent experience that is not in the resume.
 
@@ -241,135 +219,70 @@ def generate_work_experience():
         {resume_text}
     """)
 
+    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    raw = None
 
+    for model_name in MODELS:
+        try:
+            info(f"Trying model: {model_name}")
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+            )
+            raw = response.text.strip()
+            ok(f"Got response from {model_name}")
+            break
+        except Exception as e:
+            warn(f"{model_name} failed: {e}")
 
-    client = genai.Client(
-        api_key=os.environ["GEMINI_API_KEY"]
-    )
+    if not raw:
+        fail("All Gemini models failed. Check your API key and network connection.")
 
-    try:
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-        )
-        raw = response.text.strip()
-    except Exception as e:
-        fail(f"Gemini API call failed: {e}")
-
-    # Strip markdown code fences if present
     if raw.startswith("```"):
         raw = raw.split("\n", 1)[1]
         raw = raw.rsplit("```", 1)[0].strip()
 
-    # Validate JSON shape
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as e:
-        fail(
-            f"Gemini returned invalid JSON: {e}\n\n"
-            f"Raw output (first 500 chars):\n{raw[:500]}"
-        )
+        fail(f"Gemini returned invalid JSON: {e}\n\nFirst 500 chars:\n{raw[:500]}")
 
     if "experience" not in parsed or not isinstance(parsed["experience"], list):
-        fail(
-            "Gemini output is missing the 'experience' array.\n"
-            f"Got keys: {list(parsed.keys())}"
-        )
+        fail(f"Gemini output missing 'experience' array. Got keys: {list(parsed.keys())}")
 
-    if len(parsed["experience"]) == 0:
-        fail("Gemini returned an empty experience array. Check that resume.txt has content.")
+    if not parsed["experience"]:
+        fail("Gemini returned an empty experience array. Check resume.txt has content.")
 
-    required_fields = {"id", "company", "role", "start_date", "end_date", "skills", "bullets"}
+    required = {"id", "company", "role", "start_date", "end_date", "skills", "bullets"}
     for i, entry in enumerate(parsed["experience"]):
-        missing = required_fields - set(entry.keys())
+        missing = required - set(entry.keys())
         if missing:
-            fail(
-                f"Experience entry #{i+1} is missing fields: {missing}\n"
-                f"Entry: {json.dumps(entry, indent=2)[:300]}"
-            )
+            fail(f"Entry #{i+1} missing fields: {missing}\n{json.dumps(entry, indent=2)[:300]}")
         if not entry.get("bullets"):
-            fail(f"Experience entry #{i+1} ({entry.get('company')}) has no bullets.")
+            fail(f"Entry #{i+1} ({entry.get('company')}) has no bullets.")
 
-    # Save
     with open(WE_JSON, "w", encoding="utf-8") as f:
         json.dump(parsed, f, indent=2)
 
-    entries = len(parsed["experience"])
+    roles   = len(parsed["experience"])
     bullets = sum(len(e["bullets"]) for e in parsed["experience"])
-    ok(f"workExperience.json written ({entries} roles, {bullets} bullets)")
-
-    return parsed
+    ok(f"workExperience.json written ({roles} roles, {bullets} bullets)")
 
 
 # ---------------------------------------------------------------------------
-# Step 5 — Ingest resume into experience_chunks
+# Step 6 — Ingest resume (delegates to ingest_resume.py)
 # ---------------------------------------------------------------------------
 
-def ingest_resume():
-    section("Step 4 — Ingesting resume into database")
-
-    try:
-        from sentence_transformers import SentenceTransformer
-    except ImportError:
-        fail(
-            "sentence-transformers is not installed.\n"
-            "  Run: pip install -r requirements.txt"
-        )
-
-    info("Loading embedding model (all-MiniLM-L6-v2)...")
-    model = SentenceTransformer("all-MiniLM-L6-v2")
-
-    with open(WE_JSON, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM experience_chunks")
-
-    total = 0
-    for exp in data["experience"]:
-        company    = exp["company"]
-        role       = exp["role"]
-        start_date = exp["start_date"]
-        end_date   = exp["end_date"]
-        skills     = exp["skills"]
-
-        for idx, bullet in enumerate(exp["bullets"]):
-            chunk_id = f"{exp['id']}_BULLET_{idx}"
-            print(f"    Embedding: {chunk_id}")
-
-            embedding_text = f"""
-            Role: {role}
-            Company: {company}
-            Timeframe: {start_date} to {end_date}
-
-            Systems Context:
-            Cloud infrastructure, distributed systems, Linux environments, production operations
-
-            Skills (from resume metadata):
-            {", ".join(skills)}
-
-            Work Item:
-            {bullet}
-            """
-
-            embedding = model.encode(embedding_text)
-            embedding_json = json.dumps(embedding.tolist())
-
-            cursor.execute("""
-                INSERT OR REPLACE INTO experience_chunks (
-                    chunk_id, company, role, start_date, end_date,
-                    chunk_type, text, embedding
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                chunk_id, company, role, start_date, end_date,
-                "bullet", bullet, embedding_json
-            ))
-            total += 1
-
-    conn.commit()
-    conn.close()
-    ok(f"Ingestion complete — {total} chunks embedded")
+def run_ingest_resume():
+    section("Step 4b — Ingesting resume into database")
+    result = subprocess.run(
+        [sys.executable, "ingest_resume.py"],
+        cwd=BASE_DIR,
+        capture_output=False
+    )
+    if result.returncode != 0:
+        fail(f"ingest_resume.py exited with code {result.returncode}")
+    ok("Ingestion complete")
 
 
 # ---------------------------------------------------------------------------
@@ -379,36 +292,32 @@ def ingest_resume():
 def main():
     print("\n🎯 Job Hunt — First-Run Setup")
 
+    install_requirements()  # add this as first call
     validate_files()
-    init_db()
+    run_init_db()
+    download_model()
 
     if not needs_ingestion():
-        section("Step 3 — Resume ingestion")
-        info("experience_chunks already populated — skipping ingestion")
-        info("To re-ingest, delete experience_chunks rows and re-run setup.py")
+        section("Step 4 — Resume ingestion")
+        info("experience_chunks already populated — skipping")
+        info("To re-ingest: delete experience_chunks rows and re-run setup.py")
     else:
-        # workExperience.json may already exist (e.g. user wrote it manually)
         if os.path.exists(WE_JSON):
             info("workExperience.json already exists — skipping Gemini generation")
-            info("Proceeding directly to ingestion")
         else:
             generate_work_experience()
+        run_ingest_resume()
 
-        ingest_resume()
-
-    section("✅ Setup complete")
+    section("✅ Setup complete — next steps")
     print(textwrap.dedent("""
-        You're ready to run the pipeline:
+        1. Start LM Studio and load your model
+        2. Start the watcher:
+             python gmail_watcher.py
+        3. Open the dashboard in another terminal window:
+             streamlit run dashboard.py
 
-          1. Start LM Studio and load your model
-          2. Run the watcher:
-               python gmail_watcher.py
-          3. Open the dashboard:
-               streamlit run dashboard.py
-
-        Gmail OAuth: the first time you run gmail_watcher.py a browser
-        window will open for you to authorize access. credentials.json
-        is read-only during this — token.json will be written afterward.
+        Note: the first time you run gmail_watcher.py a browser window
+        will open for Gmail OAuth. token.json will be written automatically.
     """))
 
 

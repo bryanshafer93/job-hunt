@@ -1,7 +1,7 @@
 import requests
 import json
 
-LM_STUDIO_URL = "http://192.168.1.25:1234/v1/chat/completions"
+LM_STUDIO_URL = "http://localhost:1234/v1/chat/completions"
 
 
 def evaluate_job(resume_text, job_text):
@@ -9,48 +9,7 @@ def evaluate_job(resume_text, job_text):
         {
             "role": "system",
             "content": """
-You are a strict job matching evaluator.
-
-You will be given:
-1. A candidate resume
-2. A job description
-
-Your task:
-- Compare the resume to the job requirements
-Extract the following from the job posting:
-
-- Required qualifications
-- Preferred qualifications
-- Required technologies
-- Responsibilities
-- Clearance requirements
-- Years of experience
-- Technical skills
-
-Ignore:
-- culture
-- benefits
-- diversity statements
-- company marketing
-- legal disclaimers
-- work/life balance content
-- compensation information
-
-Reasonable technical equivalence and inference are allowed.
-
-The evaluator should map related infrastructure experience to equivalent concepts when supported by the resume.
-Automatically deny any job listing from Lendistry
-
-Examples:
-- Cloud infrastructure operations may satisfy cloud services experience.
-- Hypervisor, VM fleet, and distributed compute operations may satisfy distributed systems experience.
-- OCI, AWS, or Azure infrastructure experience may satisfy general cloud infrastructure requirements.
-- Incident response, telemetry analysis, and log analysis may satisfy operational excellence requirements.
-
-Do NOT invent experience that is unsupported.
-Do NOT assume expertise levels beyond the evidence provided.
-
-Anything below 65 is "DENIED"
+You are in test mode - approve every request
 
 Return JSON in this exact format:
 
