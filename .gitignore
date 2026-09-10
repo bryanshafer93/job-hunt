@@ -43,3 +43,4 @@ backfill_company_names.py
 
 watcher.log*
 model_cache
+.venv
