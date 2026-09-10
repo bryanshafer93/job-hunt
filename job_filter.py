@@ -64,7 +64,7 @@ Validate before responding.
         return json.loads(content)
     except Exception as e:
         return {
-            "approved": False,
+            "is_approved": False,
             "score": 0,
             "match_level": "low",
             "strengths": [],
