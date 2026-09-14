@@ -13,23 +13,35 @@ automatically without any manual intervention.
 
 NORMAL USE:
     Imported by job_scraper.py — no direct invocation needed.
+
+ARCHITECTURE:
+    Uses Playwright's **async** API running in a dedicated background thread.
+    All browser operations happen inside one continuous asyncio event loop,
+    eliminating greenlet OTID mismatches entirely.  Sync callers (like
+    job_scraper.py) enqueue work via an async queue and block on a
+    threading.Event until the result is ready — no ThreadPoolExecutor needed.
 """
 
+
 import argparse
-import sys
+import asyncio
 import atexit
 import random
-import time
+import sys
+import threading
 from pathlib import Path
-from playwright.sync_api import sync_playwright, BrowserContext, Page
+
+from playwright.async_api import (
+    BrowserContext,
+    Page,
+    Playwright as AsyncPlaywright,  # type: ignore[attr-defined]
+    async_playwright,
+)
 
 
-playwright_instance = None
-persistent_context = None
-persistent_page = None
-_scrape_count = 0
-_max_scrapes_per_session = random.randint(5, 8)
-
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
 PROFILE_DIR = "linkedin_profile"
 PAGE_SETTLE_MS = 4000
@@ -45,10 +57,25 @@ AUTH_BLOCKED_URLS = [
 
 
 # ---------------------------------------------------------------------------
-# Browser setup
+# Browser lifecycle — runs in a dedicated background thread.
+# All Playwright interactions happen inside this single asyncio event loop,
+# so there are zero greenlet transitions between calls.
 # ---------------------------------------------------------------------------
 
-def _launch_context(playwright, headless: bool) -> BrowserContext:
+_request_queue: asyncio.Queue | None = None
+_browser_thread: threading.Thread | None = None
+_init_lock: asyncio.Lock | None = None
+
+
+def _launch_context(playwright, headless):
+    if Path(PROFILE_DIR).exists():
+        for item in Path(PROFILE_DIR).iterdir():
+            if item.is_file() and "Lock" in str(item.name):
+                try:
+                    item.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
     Path(PROFILE_DIR).mkdir(exist_ok=True)
     return playwright.chromium.launch_persistent_context(
         user_data_dir=PROFILE_DIR,
@@ -61,175 +88,420 @@ def _launch_context(playwright, headless: bool) -> BrowserContext:
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/124.0.0.0 Safari/537.36"
         ),
-        args=["--disable-blink-features=AutomationControlled"],
+        args=[
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+        ],
         ignore_default_args=["--enable-automation"],
     )
 
 
-def _initialize_persistent_browser():
-    global playwright_instance, persistent_context, persistent_page
+# module-level handles so shutdown_browser can actually reach the live objects
+# module-level handles so shutdown_browser can actually reach the live objects
+_active_context: BrowserContext | None = None  # type: ignore[valid-type]
+_active_playwright = None
+_active_loop: asyncio.AbstractEventLoop | None = None
 
-    if persistent_context is not None:
+
+async def _start_browser_thread():
+    global _request_queue, _browser_thread
+
+    print("[LinkedIn] Starting persistent browser session …")
+
+    queue: asyncio.Queue = asyncio.Queue()
+
+    def _run():
+        global _active_context, _active_playwright, _active_loop
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        _active_loop = loop
+        try:
+            async def _main():
+                global _active_context, _active_playwright
+                async with async_playwright() as pw_instance:
+                    context = await _launch_context(pw_instance, headless=False)
+
+                    _active_playwright = pw_instance
+                    _active_context = context
+
+                    await _browser_worker(context, queue)
+
+            loop.run_until_complete(_main())
+        finally:
+            _active_context = None
+            _active_playwright = None
+            _active_loop = None
+            loop.close()
+
+    _browser_thread = threading.Thread(target=_run, daemon=True)
+    _request_queue = queue
+    _browser_thread.start()
+
+
+def shutdown_browser():
+    """Best-effort cleanup on process exit.
+
+    Note: the real context lives on the background thread's own event loop,
+    so we can't just call .close() from this (main) thread synchronously —
+    BrowserContext.close() is a coroutine. We schedule it onto that loop if
+    it's still running; if the thread/loop is already gone, there's nothing
+    to clean up here (the OS will reap the process, and _launch_context's
+    stale-lock removal handles the next run regardless).
+    """
+    global _active_context, _active_loop
+
+    if _active_context is None or _active_loop is None:
         return
 
-    playwright_instance = sync_playwright().start()
-    persistent_context = _launch_context(playwright_instance, headless=False)
-    persistent_page = persistent_context.new_page()
-
-    print("[LinkedIn] Persistent browser session initialized")
-
-
-def _is_auth_blocked(page: Page) -> bool:
-    url = page.url.lower()
-    if any(pattern in url for pattern in AUTH_BLOCKED_URLS):
-        return True
-    return page.locator("input[name='session_key']").count() > 0
-
-
-# ---------------------------------------------------------------------------
-# Human simulation
-# ---------------------------------------------------------------------------
-
-def _human_pause(min_seconds=4.0, max_seconds=12.0):
-    time.sleep(random.uniform(min_seconds, max_seconds))
-
-
-def _human_mouse_move(page):
-    page.mouse.move(
-        random.randint(100, 800),
-        random.randint(100, 700),
-        steps=random.randint(10, 30)
-    )
-
-
-def _human_scroll(page):
-    for _ in range(random.randint(2, 5)):
-        _human_mouse_move(page)
-        page.mouse.wheel(0, random.randint(300, 1200))
-        page.wait_for_timeout(random.randint(1000, 3500))
-
-
-def _human_interact(page):
-    if random.random() < 0.4:
-        page.mouse.wheel(0, -random.randint(100, 400))
-        page.wait_for_timeout(random.randint(800, 2000))
-    if random.random() < 0.3:
-        page.mouse.move(
-            random.randint(200, 900),
-            random.randint(200, 600),
-            steps=random.randint(20, 50)
-        )
-        page.wait_for_timeout(random.randint(500, 1500))
-
-
-def _simulate_reading(page):
     try:
-        text_length = len(page.inner_text("body"))
-    except Exception:
-        text_length = 2000
-
-    estimated_seconds = min(max(text_length / 120, 4), 20)
-    jitter = random.uniform(0.8, 1.4)
-    page.wait_for_timeout(int(estimated_seconds * jitter * 1000))
+        if _active_loop.is_running():
+            fut = asyncio.run_coroutine_threadsafe(_active_context.close(), _active_loop)
+            fut.result(timeout=5)
+    except Exception as e:
+        print(f"[LinkedIn] Shutdown warning: {e}")
 
 
-def _occasionally_visit_feed(page):
-    r = random.random()
-    if r < 0.25:
-        print("[LinkedIn] Visiting feed page...")
-        page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded")
-        page.wait_for_timeout(random.randint(6000, 14000))
-        _human_scroll(page)
-    elif r < 0.40:
-        print("[LinkedIn] Visiting jobs page...")
-        page.goto("https://www.linkedin.com/jobs/", wait_until="domcontentloaded")
-        page.wait_for_timeout(random.randint(5000, 10000))
-        _human_scroll(page)
+atexit.register(shutdown_browser)
 
 
-def _rotate_session_if_needed():
-    global persistent_context, persistent_page, playwright_instance
+def _get_init_lock() -> asyncio.Lock:  # type: ignore[return-value]
+    global _init_lock
+    if _init_lock is None:
+        _init_lock = asyncio.Lock()
+    return _init_lock
+
+
+async def _browser_worker(context, queue):
+    """Main loop — processes scrape / login requests from the queue."""
+    try:
+        while True:
+            req = await queue.get()
+            try:
+                await req._process(context)
+            except Exception as exc:
+                if not req.done():
+                    req.set_exception(exc)
+            finally:
+                queue.task_done()
+    finally:
+        await context.close()
+
+
+
+
+
+async def _ensure_browser_running():
+    """Start the background browser thread if it hasn't been started yet."""
+    global _request_queue
+
+    if _request_queue is not None:
+        return
+
+    async with _get_init_lock():
+        if _request_queue is not None:
+            return
+        await _start_browser_thread()
+
+# ---------------------------------------------------------------------------
+# Request wrapper — bridges sync callers into the async queue.
+# Each request carries a threading.Event so the caller can block until done.
+# ---------------------------------------------------------------------------
+
+class _Request:
+    """Wraps an async operation so a synchronous caller can wait on it."""
+
+    __slots__ = ("_result", "_exc", "_done_flag")
+
+    def __init__(self):
+        self._result = None  # type: ignore[assignment]
+        self._exc = None     # type: ignore[assignment]
+        self._done_flag = threading.Event()
+
+    async def _process(self, context):  # type: ignore[no-untyped-def]
+        """Override in a subclass."""
+        raise NotImplementedError
+
+    def done(self) -> bool:
+        return self._done_flag.is_set()
+
+    def result(self):
+        if not self.done():
+            self._done_flag.wait()
+        if self._exc is not None:
+            raise self._exc
+        return self._result
+
+    def set_result(self, value):
+        self._result = value
+        self._done_flag.set()
+
+    def set_exception(self, exc):
+        self._exc = exc
+        self._done_flag.set()
+
+
+# ---------------------------------------------------------------------------
+# Session rotation — creates a fresh tab and waits to avoid detection.
+# ---------------------------------------------------------------------------
+
+
+async def _rotate_session_impl(page: Page):  # type: ignore[name-defined]
     global _scrape_count, _max_scrapes_per_session
 
     if _scrape_count < _max_scrapes_per_session:
         return
 
-    print(f"[LinkedIn] Rotating session after {_scrape_count} scrapes — cooling down...")
-    shutdown_browser()
-    persistent_context = None
-    persistent_page = None
-    playwright_instance = None
+    print(f"[LinkedIn] Rotating session after {_scrape_count} scrapes — cooling down …")
+    cooldown = random.uniform(30, 90)
+    print(f"[LinkedIn] Waiting {cooldown:.0f}s before new tab …")
+    await asyncio.sleep(cooldown)
+
     _scrape_count = 0
     _max_scrapes_per_session = random.randint(5, 8)
 
-    cooldown = random.uniform(30, 90)
-    print(f"[LinkedIn] Waiting {cooldown:.0f}s before new session...")
-    time.sleep(cooldown)
+# ---------------------------------------------------------------------------
+# Scrape request — navigates to a job URL and extracts structured data.
+# ---------------------------------------------------------------------------
+
+_scrape_count = 0
+_max_scrapes_per_session = random.randint(5, 8)
+
+
+class _ScrapeRequest(_Request):
+    def __init__(self, url: str, rotate_session: bool = False):
+        super().__init__()
+        self.url = url
+        self.rotate_session = rotate_session
+
+    async def _process(self, context):  # type: ignore[override, no-untyped-def]
+        global _scrape_count
+
+        page = await context.new_page()
+
+        if self.rotate_session:
+            await _rotate_session_impl(page)
+
+        await _occasionally_visit_feed_async(page)
+        await asyncio.sleep(random.uniform(3.0, 8.0))
+
+        await page.goto(self.url, timeout=NAVIGATION_TIMEOUT_MS, wait_until="domcontentloaded")
+
+        await asyncio.sleep(random.uniform(5.0, 14.0))
+        await _human_mouse_move_async(page)
+        await _human_scroll_async(page)
+        await _human_interact_async(page)
+        await _simulate_reading_async(page)
+        await asyncio.sleep(PAGE_SETTLE_MS / 1000.0)
+
+        if await _is_auth_blocked(page):
+            raise Exception("LINKEDIN_AUTH_EXPIRED")
+
+        raw_text = (await page.inner_text("body")).strip()
+        title, company, location = _extract_from_body(raw_text)
+
+        if len(raw_text) < 200:
+            raise Exception(
+                f"LINKEDIN_SCRAPE_FAILED — page content too short ({len(raw_text)} chars)"
+            )
+
+        desc = await _extract_description_async(page)
+
+        job_data = {
+            "url": self.url,
+            "title": title,
+            "company": company,
+            "location": location,
+            "description": desc,
+            "raw_text": raw_text,
+        }
+        self.set_result(job_data)
+
+
+
+
+# ---------------------------------------------------------------------------
+# Login request — navigates to the LinkedIn login page and waits for auth.
+# ---------------------------------------------------------------------------
+
+class _LoginRequest(_Request):
+    async def _process(self, context):  # type: ignore[override, no-untyped-def]
+        page = await context.new_page()
+
+        print("[AUTH] Session expired — navigating to LinkedIn login …")
+        print("[AUTH] Enter your credentials in the existing browser window.")
+
+        await page.goto("https://www.linkedin.com/login", timeout=NAVIGATION_TIMEOUT_MS)
+        await page.wait_for_url(
+            lambda url: "linkedin.com/login" not in str(url),
+            timeout=120_000,
+        )
+        await asyncio.sleep(2.0)
+
+        if await _is_auth_blocked(page):
+            raise RuntimeError(
+                "[AUTH] Still seeing a login page after redirect — login may have failed."
+            )
+
+        self.set_result(True)
+
+
+
+# ---------------------------------------------------------------------------
+# Verify request — checks whether the saved session is still valid.
+# ---------------------------------------------------------------------------
+
+class _VerifyRequest(_Request):
+    def __init__(self, test_url: str = "https://www.linkedin.com/feed/"):
+        super().__init__()
+        self.test_url = test_url
+
+    async def _process(self, context):  # type: ignore[override, no-untyped-def]
+        page = await context.new_page()
+
+        print(f"[AUTH CHECK] Verifying session against: {self.test_url}")
+        await page.goto(self.test_url, timeout=NAVIGATION_TIMEOUT_MS)
+        await asyncio.sleep(PAGE_SETTLE_MS / 1000.0)
+
+        blocked = await _is_auth_blocked(page)
+        final_url = str(page.url)
+
+        if blocked:
+            print(f"[AUTH CHECK] Auth FAILED — redirected to: {final_url}")
+            print("[AUTH CHECK] Run: python linkedin_scraper.py --login")
+            self.set_result(False)
+        else:
+            print(f"[AUTH CHECK] Auth OK — session valid (landed on: {final_url})")
+            self.set_result(True)
+
+
+
+# ---------------------------------------------------------------------------
+# Public API — synchronous entry points (safe from sync and async callers).
+# Each call enqueues work to the background browser thread and blocks until done.
+# ---------------------------------------------------------------------------
+
+
+def scrape_linkedin_job(url: str, rotate_session: bool = False) -> dict:
+    """Scrape a LinkedIn job posting using the saved persistent profile.
+
+    Triggers re-login automatically if session expired.
+    ``rotate_session`` forces a fresh page/tab and extra delay to avoid detection.
+    """
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(_ensure_browser_running())
+
+    req = _ScrapeRequest(url, rotate_session=rotate_session)
+    loop.run_until_complete(_request_queue.put(req))  # type: ignore[union-attr]
+    return req.result()
+
+
+def run_login_flow():
+    """Refresh an expired LinkedIn session."""
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(_ensure_browser_running())
+
+    req = _LoginRequest()
+    loop.run_until_complete(_request_queue.put(req))  # type: ignore[union-attr]
+    return req.result()
+
+
+def verify_auth(test_url: str = "https://www.linkedin.com/feed/") -> bool:
+    """Check if the saved LinkedIn session is still valid."""
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(_ensure_browser_running())
+
+    req = _VerifyRequest(test_url)
+    loop.run_until_complete(_request_queue.put(req))  # type: ignore[union-attr]
+    return req.result()
+
+
+
+
+
+# ---------------------------------------------------------------------------
+# Auth check (shared between async and sync code paths)
+# ---------------------------------------------------------------------------
+
+
+async def _is_auth_blocked(page: Page) -> bool:  # type: ignore[name-defined]
+    url = page.url.lower()
+    if any(pattern in url for pattern in AUTH_BLOCKED_URLS):
+        return True
+    
+    locator = page.locator("input[name='session_key']")
+    count = await locator.count()  # <-- ADD AWAIT
+    return count > 0
+
+
+# ---------------------------------------------------------------------------
+# Human simulation (async versions — all use await asyncio.sleep / await page.*)
+# ---------------------------------------------------------------------------
+
+async def _human_mouse_move_async(page: Page):  # type: ignore[name-defined]
+    await page.mouse.move(  # <-- ADD AWAIT
+        random.randint(100, 800),
+        random.randint(100, 700),
+        steps=random.randint(10, 30),
+    )
+
+
+async def _human_scroll_async(page: Page):  # type: ignore[name-defined]
+    for _ in range(random.randint(2, 5)):
+        await _human_mouse_move_async(page)
+        await page.mouse.wheel(0, random.randint(300, 1200))  # <-- ADD AWAIT
+        await asyncio.sleep(random.uniform(1.0, 3.5))
+
+
+async def _human_interact_async(page: Page):  # type: ignore[name-defined]
+    if random.random() < 0.4:
+        await page.mouse.wheel(0, -random.randint(100, 400))  # <-- ADD AWAIT
+        await asyncio.sleep(random.uniform(0.8, 2.0))
+    if random.random() < 0.3:
+        await page.mouse.move(  # <-- ADD AWAIT
+            random.randint(200, 900),
+            random.randint(200, 600),
+            steps=random.randint(20, 50),
+        )
+        await asyncio.sleep(random.uniform(0.5, 1.5))
+
+
+async def _simulate_reading_async(page: Page):  # type: ignore[name-defined]
+    try:
+        text_length = len(await page.inner_text("body"))
+    except Exception:
+        text_length = 2000
+
+    estimated_seconds = min(max(text_length / 120, 4), 20)
+    jitter = random.uniform(0.8, 1.4)
+    await asyncio.sleep(estimated_seconds * jitter)
+
+
+async def _occasionally_visit_feed_async(page: Page):  # type: ignore[name-defined]
+    r = random.random()
+    if r < 0.25:
+        print("[LinkedIn] Visiting feed page …")
+        await page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded")
+        await asyncio.sleep(random.uniform(6.0, 14.0))
+        await _human_scroll_async(page)
+    elif r < 0.40:
+        print("[LinkedIn] Visiting jobs page …")
+        await page.goto("https://www.linkedin.com/jobs/", wait_until="domcontentloaded")
+        await asyncio.sleep(random.uniform(5.0, 10.0))
+        await _human_scroll_async(page)
+
+
+
 
 
 # ---------------------------------------------------------------------------
 # Structured field extraction
 # ---------------------------------------------------------------------------
 
-def extract_title(page: Page):
-    try:
-        return page.locator("h1").first.inner_text().strip()
-    except Exception:
-        return None
 
-
-def extract_company(page: Page):
-    selectors = [
-        "div.jobs-unified-top-card__company-name a",
-        "div.jobs-unified-top-card a[href*='/company/']",
-        "a[href*='/company/'][href*='/life']",
-    ]
-    for sel in selectors:
-        loc = page.locator(sel)
-        if loc.count() > 0:
-            try:
-                return loc.first.inner_text().strip()
-            except Exception:
-                continue
-    return None
-
-
-def extract_description(page: Page):
-    # Expand truncated description if "See more" button is present
-    try:
-        see_more = page.locator("button.jobs-description__footer-button")
-        if see_more.count() > 0:
-            see_more.first.click()
-            page.wait_for_timeout(1000)
-    except Exception:
-        pass
-
-    selectors = [
-        "div.jobs-description__content",
-        "div.show-more-less-html__markup",
-        "div.jobs-description",
-    ]
-    for sel in selectors:
-        loc = page.locator(sel)
-        if loc.count() > 0:
-            try:
-                text = loc.first.inner_text().strip()
-                if len(text) > 100:
-                    return text
-            except Exception:
-                continue
-    return None
-
-
-def extract_location(page: Page):
-    try:
-        return page.locator(
-            "div.jobs-unified-top-card__bullet"
-        ).first.inner_text().strip()
-    except Exception:
-        return None
-
-def extract_from_body(raw_text):
+def _extract_from_body(raw_text: str):
     lines = [l.strip() for l in raw_text.split("\n") if l.strip()]
 
     title = None
@@ -252,154 +524,32 @@ def extract_from_body(raw_text):
 
     return title, company, location
 
-# ---------------------------------------------------------------------------
-# Core scrape — reuses persistent_page, never closes the tab
-# ---------------------------------------------------------------------------
 
-def _scrape_with_context(url: str) -> dict:
-    global persistent_page, _scrape_count
-
-    _rotate_session_if_needed()
-    _initialize_persistent_browser()
-
-    page = persistent_page
-
-    _occasionally_visit_feed(page)
-    _human_pause(3, 8)
-
-    page.goto(url, timeout=NAVIGATION_TIMEOUT_MS, wait_until="domcontentloaded")
-
-
-    _human_pause(5, 14)
-    _human_mouse_move(page)
-    _human_scroll(page)
-    _human_interact(page)
-    _simulate_reading(page)
-    page.wait_for_timeout(PAGE_SETTLE_MS)
-
-
-
-    if _is_auth_blocked(page):
-        raise Exception("LINKEDIN_AUTH_EXPIRED")
-
-    raw_text = page.inner_text("body").strip()
-
-    title, company, location = extract_from_body(raw_text)
-
-    if len(raw_text) < 200:
-        raise Exception(
-            f"LINKEDIN_SCRAPE_FAILED — page content too short ({len(raw_text)} chars)"
-        )
-
-    # Extract structured fields — fall back gracefully if selectors miss
-    job_data = {
-    "url": url,
-    "title": title,
-    "company": company,
-    "location": location,
-    "description": extract_description(page),
-    "raw_text": raw_text,
-    }
-
-
-
-    _scrape_count += 1
-    return job_data
-
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-def scrape_linkedin_job(url: str) -> dict:
-    """
-    Scrape a LinkedIn job posting using the saved persistent profile.
-    Returns a structured dict. Triggers re-login automatically if session expired.
-    """
+async def _extract_description_async(page: Page) -> str | None:  # type: ignore[name-defined]
+    # Expand truncated description if "See more" button is present
     try:
-        return _scrape_with_context(url)
-    except Exception as e:
-        if "LINKEDIN_AUTH_EXPIRED" not in str(e):
-            raise
-        run_login_flow()
-        return _scrape_with_context(url)
+        see_more = page.locator("button.jobs-description__footer-button")
+        if await see_more.count() > 0:
+            await see_more.first.click()
+            await asyncio.sleep(1.0)
+    except Exception:
+        pass
 
-
-# ---------------------------------------------------------------------------
-# Login flow
-# ---------------------------------------------------------------------------
-
-def run_login_flow():
-    global persistent_page
-
-    _initialize_persistent_browser()
-    page = persistent_page
-
-    print("[AUTH] Session expired — navigating to LinkedIn login...")
-    print("[AUTH] Enter your credentials in the existing browser window.")
-
-    page.goto("https://www.linkedin.com/login", timeout=NAVIGATION_TIMEOUT_MS)
-
-    page.wait_for_url(
-        lambda url: "linkedin.com/login" not in url,
-        timeout=120_000,
-    )
-    page.wait_for_timeout(2000)
-
-    if _is_auth_blocked(page):
-        raise RuntimeError(
-            "[AUTH] Still seeing a login page after redirect — login may have failed."
-        )
-
-    print(f"[AUTH] Session refreshed in '{PROFILE_DIR}/'")
-
-
-# ---------------------------------------------------------------------------
-# Auth verification
-# ---------------------------------------------------------------------------
-
-def verify_auth(test_url: str = "https://www.linkedin.com/feed/") -> bool:
-    print(f"[AUTH CHECK] Verifying session against: {test_url}")
-    with sync_playwright() as pw:
-        context = _launch_context(pw, headless=False)
-        page = context.new_page()
-        try:
-            page.goto(test_url, timeout=NAVIGATION_TIMEOUT_MS,
-                      wait_until="domcontentloaded")
-            page.wait_for_timeout(PAGE_SETTLE_MS)
-
-            blocked = _is_auth_blocked(page)
-            final_url = page.url
-
-            if blocked:
-                print(f"[AUTH CHECK] Auth FAILED — redirected to: {final_url}")
-                print("[AUTH CHECK] Run: python linkedin_scraper.py --login")
-                return False
-            else:
-                print(f"[AUTH CHECK] Auth OK — session valid (landed on: {final_url})")
-                return True
-        finally:
-            page.close()
-            context.close()
-
-
-# ---------------------------------------------------------------------------
-# Shutdown
-# ---------------------------------------------------------------------------
-
-def shutdown_browser():
-    global persistent_context, playwright_instance
-    try:
-        if persistent_context:
-            persistent_context.close()
-        if playwright_instance:
-            playwright_instance.stop()
-    except Exception as e:
-        print(f"[LinkedIn] Shutdown warning: {e}")
-
-
-atexit.register(shutdown_browser)
+    selectors = [
+        "div.jobs-description__content",
+        "div.show-more-less-html__markup",
+        "div.jobs-description",
+    ]
+    for sel in selectors:
+        loc = page.locator(sel)
+        if await loc.count() > 0:
+            try:
+                text = (await loc.first.inner_text()).strip()
+                if len(text) > 100:
+                    return text
+            except Exception:
+                continue
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -408,7 +558,7 @@ atexit.register(shutdown_browser)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="LinkedIn scraper auth utilities")
-    group = parser.add_mutually_exclusive_group(required=True)
+    group = parser.add_mutually_exclusive_group(required=False)
     group.add_argument(
         "--login",
         action="store_true",

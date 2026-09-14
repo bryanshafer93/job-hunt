@@ -1,7 +1,7 @@
 import requests
 import json
 
-LM_STUDIO_URL = "http://localhost:1234/v1/chat/completions"
+LM_STUDIO_URL = "http://192.168.1.61:1234/v1/chat/completions"
 
 
 def evaluate_job(resume_text, job_text):
