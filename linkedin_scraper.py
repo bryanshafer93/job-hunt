@@ -64,7 +64,7 @@ AUTH_BLOCKED_URLS = [
 
 _request_queue: asyncio.Queue | None = None
 _browser_thread: threading.Thread | None = None
-_init_lock: asyncio.Lock | None = None
+_browser_ready = threading.Event()
 
 
 def _launch_context(playwright, headless):
@@ -99,34 +99,36 @@ def _launch_context(playwright, headless):
 
 
 # module-level handles so shutdown_browser can actually reach the live objects
-# module-level handles so shutdown_browser can actually reach the live objects
 _active_context: BrowserContext | None = None  # type: ignore[valid-type]
 _active_playwright = None
 _active_loop: asyncio.AbstractEventLoop | None = None
+_active_page: Page | None = None  # type: ignore[valid-type]
+_init_lock_sync = threading.Lock()
 
 
-async def _start_browser_thread():
+def _start_browser_thread_sync():
     global _request_queue, _browser_thread
 
     print("[LinkedIn] Starting persistent browser session …")
 
-    queue: asyncio.Queue = asyncio.Queue()
-
     def _run():
-        global _active_context, _active_playwright, _active_loop
+        global _active_context, _active_playwright, _active_loop, _request_queue
 
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         _active_loop = loop
+
+        queue: asyncio.Queue = asyncio.Queue()
+        _request_queue = queue
+
         try:
             async def _main():
                 global _active_context, _active_playwright
                 async with async_playwright() as pw_instance:
                     context = await _launch_context(pw_instance, headless=False)
-
                     _active_playwright = pw_instance
                     _active_context = context
-
+                    _browser_ready.set()
                     await _browser_worker(context, queue)
 
             loop.run_until_complete(_main())
@@ -137,9 +139,19 @@ async def _start_browser_thread():
             loop.close()
 
     _browser_thread = threading.Thread(target=_run, daemon=True)
-    _request_queue = queue
     _browser_thread.start()
 
+
+def _ensure_browser_running_sync():
+    """Start the background browser thread if it hasn't been started yet. Thread-safe, sync."""
+    global _browser_thread
+
+    with _init_lock_sync:
+        if _browser_thread is not None:
+            _browser_ready.wait()
+            return
+        _start_browser_thread_sync()
+    _browser_ready.wait()
 
 def shutdown_browser():
     """Best-effort cleanup on process exit.
@@ -189,21 +201,6 @@ async def _browser_worker(context, queue):
     finally:
         await context.close()
 
-
-
-
-
-async def _ensure_browser_running():
-    """Start the background browser thread if it hasn't been started yet."""
-    global _request_queue
-
-    if _request_queue is not None:
-        return
-
-    async with _get_init_lock():
-        if _request_queue is not None:
-            return
-        await _start_browser_thread()
 
 # ---------------------------------------------------------------------------
 # Request wrapper — bridges sync callers into the async queue.
@@ -278,9 +275,19 @@ class _ScrapeRequest(_Request):
 
     async def _process(self, context):  # type: ignore[override, no-untyped-def]
         global _scrape_count
-
-        page = await context.new_page()
-
+        global _active_page
+        if _active_page is None or _active_page.is_closed():
+            _active_page = await context.new_page()
+        else:
+            try:
+                await _active_page.goto("about:blank", timeout=10_000)
+            except Exception:
+                try:
+                    await _active_page.close()
+                except Exception:
+                    pass
+                _active_page = await context.new_page()
+        page = _active_page
         if self.rotate_session:
             await _rotate_session_impl(page)
 
@@ -383,42 +390,32 @@ class _VerifyRequest(_Request):
 # Each call enqueues work to the background browser thread and blocks until done.
 # ---------------------------------------------------------------------------
 
-
 def scrape_linkedin_job(url: str, rotate_session: bool = False) -> dict:
-    """Scrape a LinkedIn job posting using the saved persistent profile.
-
-    Triggers re-login automatically if session expired.
-    ``rotate_session`` forces a fresh page/tab and extra delay to avoid detection.
-    """
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(_ensure_browser_running())
+    _ensure_browser_running_sync()  # see below
 
     req = _ScrapeRequest(url, rotate_session=rotate_session)
-    loop.run_until_complete(_request_queue.put(req))  # type: ignore[union-attr]
+    fut = asyncio.run_coroutine_threadsafe(_request_queue.put(req), _active_loop)
+    fut.result()  # wait for the put itself to complete
     return req.result()
 
 
 def run_login_flow():
     """Refresh an expired LinkedIn session."""
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(_ensure_browser_running())
+    _ensure_browser_running_sync()
 
     req = _LoginRequest()
-    loop.run_until_complete(_request_queue.put(req))  # type: ignore[union-attr]
+    fut = asyncio.run_coroutine_threadsafe(_request_queue.put(req), _active_loop)
+    fut.result()
     return req.result()
-
 
 def verify_auth(test_url: str = "https://www.linkedin.com/feed/") -> bool:
     """Check if the saved LinkedIn session is still valid."""
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(_ensure_browser_running())
+    _ensure_browser_running_sync()
 
     req = _VerifyRequest(test_url)
-    loop.run_until_complete(_request_queue.put(req))  # type: ignore[union-attr]
+    fut = asyncio.run_coroutine_threadsafe(_request_queue.put(req), _active_loop)
+    fut.result()
     return req.result()
-
-
-
 
 
 # ---------------------------------------------------------------------------
